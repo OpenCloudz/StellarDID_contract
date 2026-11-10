@@ -129,6 +129,41 @@ impl DidRegistry {
         read_did(&env, &did).map(|entry| entry.document_hash)
     }
 
+    /// Verify that a subject holds a valid, non-revoked, non-expired credential
+    /// of the given type.
+    ///
+    /// Callable by any Soroban contract or external account without authentication.
+    ///
+    /// # Returns
+    /// - `true` if an active credential exists for `subject` with `credential_type`,
+    ///   it is not revoked, and its expiration timestamp (if configured) has not
+    ///   been exceeded.
+    /// - `false` (without panicking) when no credential is found, or if the credential
+    ///   has been revoked, or if it has expired.
+    pub fn verify(env: Env, subject: Address, credential_type: Symbol) -> bool {
+        let credential_id = match read_subject_credential(&env, &subject, &credential_type) {
+            Some(id) => id,
+            None => return false,
+        };
+
+        let entry = match read_credential(&env, &credential_id) {
+            Some(entry) => entry,
+            None => return false,
+        };
+
+        if entry.revoked {
+            return false;
+        }
+
+        if let Some(expires_at) = entry.expires_at {
+            if expires_at <= env.ledger().timestamp() {
+                return false;
+            }
+        }
+
+        true
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
@@ -548,5 +583,112 @@ mod tests {
         let did = String::from_str(&env, "did:stellar:GUNKNOWN999");
         let result = client.resolve(&did);
         assert_eq!(result, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // verify() integration tests
+    // -----------------------------------------------------------------------
+
+    /// verify() returns true when the subject holds a valid, active credential.
+    #[test]
+    fn test_verify_valid_credential() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000_000);
+
+        let contract_id = env.register(DidRegistry, ());
+        let client = DidRegistryClient::new(&env, &contract_id);
+
+        let issuer = Address::generate(&env);
+        let subject = Address::generate(&env);
+        let cred_type = symbol_short!("KYC");
+        let cred_hash = make_cred_hash(&env, 10);
+
+        client
+            .try_issue_credential(&issuer, &subject, &cred_type, &cred_hash, &None)
+            .expect("call should not panic")
+            .expect("issuance should succeed");
+
+        let verified = client.verify(&subject, &cred_type);
+        assert!(
+            verified,
+            "valid non-expired credential must verify successfully"
+        );
+    }
+
+    /// verify() returns false when a credential has been revoked.
+    #[test]
+    fn test_verify_revoked_credential() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000_000);
+
+        let contract_id = env.register(DidRegistry, ());
+        let client = DidRegistryClient::new(&env, &contract_id);
+
+        let issuer = Address::generate(&env);
+        let subject = Address::generate(&env);
+        let cred_type = symbol_short!("KYC");
+        let cred_hash = make_cred_hash(&env, 20);
+
+        let cred_id = client
+            .try_issue_credential(&issuer, &subject, &cred_type, &cred_hash, &None)
+            .expect("call should not panic")
+            .expect("issuance should succeed");
+
+        env.as_contract(&contract_id, || {
+            let mut entry = read_credential(&env, &cred_id).unwrap();
+            entry.revoked = true;
+            write_credential(&env, &cred_id, &entry);
+        });
+
+        let verified = client.verify(&subject, &cred_type);
+        assert!(!verified, "revoked credential must return false on verify");
+    }
+
+    /// verify() returns false when a credential has expired.
+    #[test]
+    fn test_verify_expired_credential() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000_000);
+
+        let contract_id = env.register(DidRegistry, ());
+        let client = DidRegistryClient::new(&env, &contract_id);
+
+        let issuer = Address::generate(&env);
+        let subject = Address::generate(&env);
+        let cred_type = symbol_short!("KYC");
+        let cred_hash = make_cred_hash(&env, 30);
+        let expires_at = Some(1_500_000);
+
+        client
+            .try_issue_credential(&issuer, &subject, &cred_type, &cred_hash, &expires_at)
+            .expect("call should not panic")
+            .expect("issuance should succeed");
+
+        // Before expiry: verify is true
+        assert!(client.verify(&subject, &cred_type));
+
+        // Advance past expiration: verify is false
+        env.ledger().set_timestamp(1_500_001);
+        assert!(!client.verify(&subject, &cred_type));
+    }
+
+    /// verify() returns false (without panicking) for an unknown subject or credential type.
+    #[test]
+    fn test_verify_unknown_subject_returns_false() {
+        let env = Env::default();
+        let contract_id = env.register(DidRegistry, ());
+        let client = DidRegistryClient::new(&env, &contract_id);
+
+        let unknown_subject = Address::generate(&env);
+        let cred_type = symbol_short!("KYC");
+
+        let verified = client.verify(&unknown_subject, &cred_type);
+        assert!(
+            !verified,
+            "unknown subject must return false without panicking"
+        );
     }
 }
